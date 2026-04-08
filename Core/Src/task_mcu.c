@@ -23,6 +23,33 @@ static osMutexId_t s_mutex = NULL;
 
 // 解析属性参数字符串（空格分隔）
 // 格式: <siid> <piid> [<siid> <piid>]...
+/*---------------------------------------------------------------------------
+ Name        : parse_property_params
+ Input       : char *string, mcu_msg_params_t *params_list, int max_count
+ Output      : None
+ Description :
+ 解析云端下行命令中属性查询参数列表（get_properties），将参数转换为结构化的
+ `mcu_msg_params_t` 数组，供后续属性读取与响应构建使用。
+
+ 输入参数：
+ - string：可修改的参数字符串缓冲区。函数会在分割 token 时写入 '\0'，
+   因此必须是可写内存（不可传入只读常量）。
+ - params_list：输出数组指针，元素类型为 `mcu_msg_params_t`；函数会清零并填充。
+ - max_count：params_list 最大可填充条目数，防止越界写入。
+
+ 支持的参数格式：
+ - 空格分隔的成对数字：`<siid> <piid> <siid> <piid> ...`
+   例如：`"2 1 2 2 1 3"` 表示读取多个服务/属性。
+
+ 解析策略：
+ - 先在原字符串上就地切分，得到 token 指针数组 root[]；
+ - 再以 2 个 token 为一组（siid/piid）进行解析；
+ - 当遇到非数字 token 或 token 不成对时停止解析；
+ - 对每个成功解析的条目设置 `flag=1` 表示有效。
+
+ 典型使用场景：
+ - `handle_get_properties()` 在解析云端参数后按 (siid,piid) 逐项读取设备属性。
+---------------------------------------------------------------------------*/
 static void parse_property_params(char *string, mcu_msg_params_t *params_list, int max_count) {
     char *root[64];
     int num = 0;
@@ -59,6 +86,37 @@ static void parse_property_params(char *string, mcu_msg_params_t *params_list, i
 
 // 解析设置属性参数字符串
 // 格式: <siid> <piid> <value> <siid> <piid> <value>...
+/*---------------------------------------------------------------------------
+ Name        : parse_set_params
+ Input       : char *string, mcu_msg_params_t *params_list, int max_count
+ Output      : None
+ Description :
+ 解析云端下行命令中属性设置参数列表（set_properties），将参数转换为结构化的
+ `mcu_msg_params_t` 数组，供后续写属性逻辑与响应构建使用。
+
+ 输入参数：
+ - string：可修改的参数字符串缓冲区，函数会在切分 token 时写入 '\0'。
+ - params_list：输出数组指针；函数会清零并逐项填充。
+ - max_count：最多解析/填充的条目数，避免越界。
+
+ 支持的参数格式（空格分隔的三元组）：
+ - `<siid> <piid> <value> <siid> <piid> <value> ...`
+ value 支持以下类型（按当前实现）：
+ - true/false：布尔类型，对应 `MCU_VALUE_TYPE_TRUE/FALSE`
+ - "xxx"：双引号包裹的字符串（会去掉首尾引号），对应 `MCU_VALUE_TYPE_STRING`
+ - 数字：整数或浮点（含 '.' 判定为浮点），对应 `MCU_VALUE_TYPE_INT/FLOAT`
+
+ 输出结构字段约定：
+ - siid/piid：属性标识
+ - value/value_type：对整型/布尔值使用 value + value_type
+ - f_value/value_type：对浮点使用 f_value + value_type
+ - s_value/value_type：对字符串使用 s_value（指向 string 内部切分后的区域）
+ - flag=1：表示该条目有效
+
+ 注意事项：
+ - 字符串类型的 s_value 指针依赖入参 string 的生命周期，调用者需保证
+   在后续处理期间该缓冲区仍然有效。
+---------------------------------------------------------------------------*/
 static void parse_set_params(char *string, mcu_msg_params_t *params_list, int max_count) {
     char *root[64];
     int num = 0;
@@ -120,6 +178,31 @@ static void parse_set_params(char *string, mcu_msg_params_t *params_list, int ma
 
 // 处理get_properties命令
 // 返回响应字符串到response buffer
+/*---------------------------------------------------------------------------
+ Name        : handle_get_properties
+ Input       : const char *params, char *response, int resp_max_len
+ Output      : None
+ Description :
+ 处理云端下行的 get_properties 请求：解析参数列表并把读取结果按协议格式拼接到
+ response 缓冲区中。
+
+ 输入参数：
+ - params：属性参数字符串，格式为 `<siid> <piid> ...`（空格分隔）。
+ - response：输出响应缓冲区指针，用于返回组装后的文本响应。
+ - resp_max_len：response 最大长度，函数内部会尽量避免写越界。
+
+ 输出协议（当前实现的文本格式）：
+ - 以 "result" 开头，随后每个属性追加：
+   - 成功：` <siid> <piid> 0 <value>`
+   - 失败：` <siid> <piid> -4003`（属性不存在）
+
+ 属性映射（按当前实现）：
+ - DEVICE_INFO_SIID(1)：产品型号/序列号/固件版本/硬件版本等静态信息
+ - SYSTEM_SIID(2)：运行状态/功率/电量/温度/电压/故障码等动态信息（需互斥读）
+
+ 线程安全：
+ - 读取 SYSTEM_SIID 对应的 `s_device_info` 时会加 `s_mutex`，保证读取一致。
+---------------------------------------------------------------------------*/
 static void handle_get_properties(const char *params, char *response, int resp_max_len) {
     mcu_msg_params_t params_list[24];
     char params_copy[256];
@@ -206,6 +289,28 @@ static void handle_get_properties(const char *params, char *response, int resp_m
 
 // 处理set_properties命令
 // 返回响应字符串到response buffer
+/*---------------------------------------------------------------------------
+ Name        : handle_set_properties
+ Input       : const char *params, char *response, int resp_max_len
+ Output      : None
+ Description :
+ 处理云端下行的 set_properties 请求：解析要写入的属性列表，并按协议格式构建
+ 每个属性写入的结果码到 response 缓冲区中。
+
+ 输入参数：
+ - params：设置参数字符串，格式为 `<siid> <piid> <value> ...`
+ - response：输出响应缓冲区
+ - resp_max_len：输出缓冲区最大长度
+
+ 输出协议（当前实现）：
+ - 以 "result" 开头，随后每个属性追加：
+   ` <siid> <piid> <result_code>`
+   其中 result_code 当前固定为 0（成功），用于示例占位。
+
+ 业务说明：
+ - 当前实现仅完成参数解析与响应框架，实际“写属性并持久化”的逻辑尚未补齐；
+ - 需要扩展时，建议按 (siid,piid) 分发到具体模块，并根据写入结果返回非 0 错误码。
+---------------------------------------------------------------------------*/
 static void handle_set_properties(const char *params, char *response, int resp_max_len) {
     mcu_msg_params_t params_list[16];
     char params_copy[256];
@@ -235,6 +340,26 @@ static void handle_set_properties(const char *params, char *response, int resp_m
 }
 
 // 处理action命令
+/*---------------------------------------------------------------------------
+ Name        : handle_action
+ Input       : const char *params, char *response, int resp_max_len
+ Output      : None
+ Description :
+ 处理云端下行的 action 请求：解析 (siid, aiid, action_params)，并根据动作类型
+ 构建对应的执行结果响应。
+
+ 输入参数：
+ - params：动作参数字符串，当前按 `"<siid> <aiid> <params>"` 形式解析。
+ - response：输出响应缓冲区
+ - resp_max_len：输出缓冲区最大长度
+
+ 输出协议（当前实现）：
+ - 以 "result" 开头，成功时追加 ` <siid> <aiid> 0`
+ - 不支持的动作返回 ` <siid> <aiid> -4003`
+
+ 当前实现示例：
+ - SYSTEM_SIID(2), aiid==1：重启动作（仅返回成功响应，实际重启逻辑待补齐）
+---------------------------------------------------------------------------*/
 static void handle_action(const char *params, char *response, int resp_max_len) {
     int siid = 0, aiid = 0;
     char action_params[128] = "";
@@ -254,6 +379,30 @@ static void handle_action(const char *params, char *response, int resp_max_len) 
 }
 
 // 构建属性变化上报payload
+/*---------------------------------------------------------------------------
+ Name        : build_properties_changed
+ Input       : char *payload, int max_len
+ Output      : int
+ Description :
+ 根据当前待上报属性标志 `s_prop_flags`，从 `s_device_info` 读取对应字段并构建
+ "properties_changed ..." 文本上报 payload。
+
+ 输入参数：
+ - payload：输出缓冲区，用于存放构建后的上报字符串
+ - max_len：payload 最大长度
+
+ 构建规则：
+ - 仅对 `s_prop_flags` 指示为“发生变化/需要上报”的属性进行拼接；
+ - 每个属性追加格式示例：`properties_changed <siid> <piid> <value> ...`
+ - 属性字段来源于 `s_device_info`（动态属性）或宏定义（静态属性由其他流程上报）。
+
+ 线程安全：
+ - 构建过程中会对 `s_device_info` 的读取加 `s_mutex` 互斥，避免并发更新导致不一致。
+
+ 返回值约定：
+ - 返回值为实际写入 payload 的字符数（snprintf 方式累计 offset）；
+ - 若没有任何可上报属性，则可能返回 0。
+---------------------------------------------------------------------------*/
 static int build_properties_changed(char *payload, int max_len) {
     int offset = 0;
 
@@ -294,6 +443,28 @@ static int build_properties_changed(char *payload, int max_len) {
 // ==================== 公开API ====================
 
 // MQTT消息回调处理函数（静态，在init时注册）
+/*---------------------------------------------------------------------------
+ Name        : mcu_mqtt_callback
+ Input       : const char *topic, const char *payload, int len
+ Output      : None
+ Description :
+ MCU 模块的 MQTT 下行统一回调入口。
+ 该函数由 AT/MQTT 层在收到 "+MQTTURC: \"message\"" 后分发调用（见 `at_parser.c`），
+ 用于将云端下行消息解析为 MCU 侧可执行的 get/set/action 命令，并在需要时回包。
+
+ 输入参数：
+ - topic：MQTT 主题字符串
+ - payload：消息内容（通常为文本协议或 JSON）
+ - len：payload 长度
+
+ 处理流程：
+ - 调用 `mcu_handle_cloud_message()` 解析并生成 response；
+ - 若解析成功且 response 非空，则发布到 `DATA_TOPIC` 回传云端。
+
+ 注意：
+ - 当前实现将所有响应统一发布到 DATA_TOPIC；若云端协议需要区分 reply topic，
+   需在此处根据 topic/协议字段进行路由。
+---------------------------------------------------------------------------*/
 static void mcu_mqtt_callback(const char *topic, const char *payload, int len) {
     char response[512];
     int ret = mcu_handle_cloud_message(topic, payload, len, response, sizeof(response));
@@ -303,6 +474,24 @@ static void mcu_mqtt_callback(const char *topic, const char *payload, int len) {
     }
 }
 
+/*---------------------------------------------------------------------------
+ Name        : MCU_Task_Init
+ Input       : None
+ Output      : None
+ Description :
+ 初始化 MCU 业务处理模块的基础资源与默认设备信息，并注册 MQTT 下行回调。
+
+ 初始化内容：
+ - 创建互斥锁 `s_mutex`：用于保护 `s_device_info` 与 `s_prop_flags` 等共享数据；
+ - 注册 MQTT 消息回调：
+   - 通过 `at_mqtt_register_callback(mcu_mqtt_callback)` 将下行消息引入 MCU 处理链路；
+ - 初始化默认设备信息 `s_device_info`：
+   - 写入 model/sw_version/sn 等静态字段；
+   - 设置运行状态/功率/电量/温度/电压/故障码等默认值。
+
+ 调用时机：
+ - 由 `MCU_Task()` 在任务启动时调用一次。
+---------------------------------------------------------------------------*/
 void MCU_Task_Init(void) {
     if (s_mutex == NULL) {
         osMutexAttr_t mutex_attr = { .name = "mcu_info" };
@@ -326,6 +515,32 @@ void MCU_Task_Init(void) {
     s_device_info.fault_code = 0;
 }
 
+/*---------------------------------------------------------------------------
+ Name        : MCU_Task
+ Input       : void *argument
+ Output      : None
+ Description :
+ MCU 业务主任务：负责属性变化上报、定时心跳上报，以及等待 Cloud 初始化同步点后再开始运行。
+
+ 输入参数：
+ - argument：RTOS 任务入口参数，当前未使用。
+
+ 任务流程（按当前实现）：
+ - 调用 `MCU_Task_Init()` 完成资源创建与回调注册；
+ - 等待 Cloud 任务完成初始化（MQTT 已连接）：
+   - 通过 `task_sync_get_cloud_ready_flag()` 获取事件标志组；
+   - 等待 `CLOUD_READY_FLAG_ID` 被设置（不清除标志）。
+ - 首次上报：设置 `MCU_PROP_DEVICE_INFO | MCU_PROP_RUN_STATE` 触发上报；
+ - 主循环每 100ms 执行：
+   - 若 `s_prop_flags != 0`，则调用 `build_properties_changed()` 构建 payload 并发布；
+     发布成功后清除 `s_prop_flags`；
+   - 否则累计计时，达到 `PROP_REPORT_INTERVAL_MS` 后执行“定期上报”（即使无变化也上报，
+     用于保持连接/云端活性）。
+
+ 并发说明：
+ - 属性变化通常由其他业务模块调用 `mcu_update_device_info()` 或 `mcu_set_prop_changed()`
+   设置标志，MCU_Task 负责统一节流与上报发送。
+---------------------------------------------------------------------------*/
 void MCU_Task(void *argument) {
     (void)argument;
 
@@ -371,16 +586,65 @@ void MCU_Task(void *argument) {
     }
 }
 
+/*---------------------------------------------------------------------------
+ Name        : mcu_set_prop_changed
+ Input       : mcu_prop_flag_t prop
+ Output      : None
+ Description :
+ 设置“属性需要上报”的标志位，用于触发 MCU_Task 在下一周期构建并发送
+ properties_changed 上报。
+
+ 输入参数：
+ - prop：属性标志位（可按位或组合），类型为 `mcu_prop_flag_t`。
+
+ 线程安全：
+ - 内部使用 `s_mutex` 保护对 `s_prop_flags` 的读改写，避免并发置位丢失。
+---------------------------------------------------------------------------*/
 void mcu_set_prop_changed(mcu_prop_flag_t prop) {
     osMutexAcquire(s_mutex, osWaitForever);
     s_prop_flags |= (uint32_t)prop;
     osMutexRelease(s_mutex);
 }
 
+/*---------------------------------------------------------------------------
+ Name        : mcu_get_device_info
+ Input       : None
+ Output      : const mcu_device_info_t*
+ Description :
+ 获取当前设备信息结构体的只读指针。
+
+ 返回说明：
+ - 返回 `s_device_info` 的地址，供只读访问（例如 UI 显示/调试输出）。
+
+ 注意：
+ - 该函数不加锁；若调用方需要读取一致快照，建议在调用方侧加锁或提供拷贝接口；
+ - 若调用方仅做非关键显示，通常可接受读取过程中字段被更新的轻微不一致。
+---------------------------------------------------------------------------*/
 const mcu_device_info_t* mcu_get_device_info(void) {
     return &s_device_info;
 }
 
+/*---------------------------------------------------------------------------
+ Name        : mcu_update_device_info
+ Input       : const mcu_device_info_t *info
+ Output      : None
+ Description :
+ 更新设备动态信息 `s_device_info`，并根据字段变化自动置位对应的属性上报标志。
+
+ 输入参数：
+ - info：外部采样/计算得到的设备信息（新值），不能为空。
+
+ 行为说明：
+ - 在互斥保护下逐字段比较 old/new：
+   - run_state/power/energy/temperature/voltage/fault_code 等；
+ - 对发生变化的字段累计到 changed 标志集合；
+ - 将 changed 合并到 `s_prop_flags`，触发 MCU_Task 进行上报。
+
+ 设计意图：
+ - 将“数据采集/计算”和“上报节流/发送”解耦：
+   - 采集侧只负责调用本函数提交新数据；
+   - 上报由 MCU_Task 统一在合适的时机发送，避免频繁 publish。
+---------------------------------------------------------------------------*/
 void mcu_update_device_info(const mcu_device_info_t *info) {
     if (info == NULL) return;
 
@@ -420,6 +684,42 @@ void mcu_update_device_info(const mcu_device_info_t *info) {
     osMutexRelease(s_mutex);
 }
 
+/*---------------------------------------------------------------------------
+ Name        : mcu_handle_cloud_message
+ Input       : const char *topic, const char *payload, int len,
+               char *response, int resp_max_len
+ Output      : int
+ Description :
+ 解析云端下行消息并生成 MCU 侧响应字符串。
+
+ 输入参数：
+ - topic：MQTT 主题（当前实现未使用，但保留用于未来按 topic 路由/鉴权）
+ - payload：消息内容（支持两类格式）
+ - len：payload 长度
+ - response：输出响应缓冲区
+ - resp_max_len：响应缓冲区最大长度
+
+ 支持的下行格式：
+ 1) 文本协议：
+    - 形如：`down get_properties ...` / `down set_properties ...` / `down action ...`
+ 2) JSON 简化协议：
+    - 形如：`{"cmd":"get_properties","params":"..."}`
+      同理支持 set_properties / action
+
+ 处理流程：
+ - 将 payload 拷贝到本地可修改缓冲区 buf，并确保 '\0' 终止；
+ - 先尝试查找 "down " 前缀走文本协议分支；
+ - 若不存在，则尝试从 JSON 中提取 cmd 与 params 字段；
+ - 根据命令类型分别调用：
+   - `handle_get_properties()`
+   - `handle_set_properties()`
+   - `handle_action()`
+ - 若解析成功，response 中写入以 "result" 开头的响应文本。
+
+ 返回值约定：
+ - 返回 0：识别并处理成功（response 可能为空或包含结果）
+ - 返回 -1：无法识别的格式/命令或缺少关键字段
+---------------------------------------------------------------------------*/
 int mcu_handle_cloud_message(const char *topic, const char *payload, int len,
                              char *response, int resp_max_len) {
     (void)topic;
