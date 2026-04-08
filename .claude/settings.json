@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/Document_Ref/wifi-ge-esp32-c3-master/main/**)",
+      "Read(//d/Document_Ref/wifi-ge-esp32-c3-master/**)"
+    ]
+  }
+}
